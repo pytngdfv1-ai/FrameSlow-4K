@@ -41,6 +41,7 @@ jobs:
             .buildozer
             ~/.buildozer
           key: buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-
 
       - name: Versión incremental
         run: |

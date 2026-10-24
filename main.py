@@ -54,15 +54,20 @@ class Viewer(BoxLayout):
         self.info = Label(text="Selecciona un video", size_hint_y=0.07)
         self.slider = Slider(min=0, max=1, value=0, size_hint_y=0.07)
         self.slider.bind(value=self.on_slider)
+        self.panel = BoxLayout(orientation="vertical", spacing=4)
         self.add_widget(self.img)
-        self.add_widget(self.info)
-        self.add_widget(self.slider)
+        self.add_widget(self.panel)
+        self.info.halign = "center"
+        self.info.valign = "middle"
+        self.info.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.panel.add_widget(self.info)
+        self.panel.add_widget(self.slider)
 
         row = BoxLayout(size_hint_y=0.08, spacing=4)
         row.add_widget(Button(text="Video", on_release=lambda *_: self.pick()))
         for t, d in (("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)):
             row.add_widget(Button(text=t, on_release=lambda _, d=d: self.step(d)))
-        self.add_widget(row)
+        self.panel.add_widget(row)
 
         row2 = BoxLayout(size_hint_y=0.08, spacing=4)
         row2.add_widget(Button(text="Inicio", on_release=lambda *_: self.set_start()))
@@ -70,13 +75,21 @@ class Viewer(BoxLayout):
         self.fmt = ToggleButton(text="PNG", state="normal")
         self.fmt.bind(state=lambda w, s: setattr(w, "text", "JPG100" if s == "down" else "PNG"))
         row2.add_widget(self.fmt)
-        self.add_widget(row2)
+        self.panel.add_widget(row2)
 
         row3 = BoxLayout(size_hint_y=0.08, spacing=4)
         row3.add_widget(Button(text="Guardar frame", on_release=lambda *_: self.save_one()))
         row3.add_widget(Button(text="Guardar rango", on_release=lambda *_: self.save_range()))
         row3.add_widget(Button(text="Auto nítidos", on_release=lambda *_: self.auto_sharp()))
-        self.add_widget(row3)
+        self.panel.add_widget(row3)
+        self.bind(size=self.relayout)
+        self.relayout()
+
+    def relayout(self, *a):
+        land = self.width > self.height
+        self.orientation = "horizontal" if land else "vertical"
+        self.img.size_hint = (0.62, 1) if land else (1, 0.5)
+        self.panel.size_hint = (0.38, 1) if land else (1, 0.5)
 
     # ---------- util ----------
     @mainthread
