@@ -16,7 +16,6 @@ android.ndk = 25b
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 android.enable_androidx = True
-android.add_jars =
 p4a.branch = v2024.01.21
 
 [buildozer]
