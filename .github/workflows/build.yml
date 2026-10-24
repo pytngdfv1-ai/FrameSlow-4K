@@ -14,10 +14,6 @@ jobs:
       KS_B64: ${{ secrets.KEYSTORE_B64 }}
       KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
     steps:
-      - name: Verificar secrets de firma
-        run: |
-          test -n "$KS_B64" && test -n "$KS_PASS" || { echo "Faltan secrets KEYSTORE_B64 / KEYSTORE_PASSWORD"; exit 1; }
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -54,15 +50,20 @@ jobs:
       - name: Compilar APK
         run: buildozer -v android debug
 
-      - name: Firmar APK con keystore propio
+      - name: Firmar APK (si hay keystore) o usar APK debug
         run: |
-          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks.jks"
-          BT=$(ls -d $HOME/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
           APK=$(ls bin/*.apk | head -1)
-          $BT/zipalign -p -f 4 "$APK" aligned.apk
-          $BT/apksigner sign --ks "$RUNNER_TEMP/ks.jks" --ks-key-alias frameslow \
-            --ks-pass env:KS_PASS --key-pass env:KS_PASS --out FrameSlow4K.apk aligned.apk
-          $BT/apksigner verify --print-certs FrameSlow4K.apk
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks.jks"
+            BT=$(ls -d $HOME/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
+            $BT/zipalign -p -f 4 "$APK" aligned.apk
+            $BT/apksigner sign --ks "$RUNNER_TEMP/ks.jks" --ks-key-alias frameslow \
+              --ks-pass env:KS_PASS --key-pass env:KS_PASS --out FrameSlow4K.apk aligned.apk
+            $BT/apksigner verify --print-certs FrameSlow4K.apk
+          else
+            echo "Sin keystore: APK firmado con clave debug (no actualizable sobre uno firmado)"
+            cp "$APK" FrameSlow4K.apk
+          fi
 
       - name: Publicar release
         uses: softprops/action-gh-release@v2
