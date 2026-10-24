@@ -3,13 +3,16 @@ import cv2
 import numpy as np
 from kivy.app import App
 from kivy.clock import Clock, mainthread
+from kivy.core.window import Window
+from kivy.graphics import Color, Rectangle
 from kivy.graphics.texture import Texture
+from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.slider import Slider
-from kivy.uix.togglebutton import ToggleButton
 from kivy.utils import platform
 
 OUT_DIR = "/storage/emulated/0/DCIM/Frames4K"
@@ -24,9 +27,10 @@ if platform == "android":
              Permission.READ_EXTERNAL_STORAGE,
              Permission.WRITE_EXTERNAL_STORAGE]
 
+Window.clearcolor = (0, 0, 0, 1)
+
 
 def scan_media(path):
-    """Hace visible el archivo en la galería."""
     if platform != "android":
         return
     try:
@@ -40,7 +44,7 @@ def scan_media(path):
 
 def open_cap(path):
     cap = cv2.VideoCapture(path)
-    try:  # controlamos nosotros la rotación
+    try:
         cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
     except Exception:
         pass
@@ -48,14 +52,13 @@ def open_cap(path):
 
 
 def detect_rotation(path, cap):
-    """Grados horarios para ver el video derecho (0/90/180/270)."""
     if platform == "android":
         try:
             from jnius import autoclass
             MMR = autoclass("android.media.MediaMetadataRetriever")
             r = MMR()
             r.setDataSource(path)
-            v = r.extractMetadata(24)  # METADATA_KEY_VIDEO_ROTATION
+            v = r.extractMetadata(24)
             r.release()
             if v is not None:
                 return int(v) % 360
@@ -82,7 +85,6 @@ def rotate(f, deg):
 
 
 def frame_score(f):
-    """Nitidez (Laplaciano) penalizada por sobre/subexposición."""
     h, w = f.shape[:2]
     g = cv2.cvtColor(cv2.resize(f, (960, max(int(960 * h / w), 1)), interpolation=cv2.INTER_AREA),
                      cv2.COLOR_BGR2GRAY)
@@ -91,9 +93,37 @@ def frame_score(f):
     return lap * (1.0 - min(clip, 0.9))
 
 
-class Viewer(BoxLayout):
+class TButton(Button):
+    """Botón semitransparente."""
     def __init__(self, **kw):
-        super().__init__(orientation="vertical", spacing=4, padding=4, **kw)
+        kw.setdefault("background_normal", "")
+        kw.setdefault("background_down", "")
+        kw.setdefault("background_color", (0, 0, 0, 0.38))
+        kw.setdefault("color", (1, 1, 1, 0.95))
+        kw.setdefault("font_size", "13sp")
+        self.base = kw["background_color"]
+        super().__init__(**kw)
+        self.bind(state=self._st)
+
+    def _st(self, w, s):
+        w.background_color = (1, 1, 1, 0.35) if s == "down" else self.base
+
+
+class InfoLabel(Label):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        with self.canvas.before:
+            Color(0, 0, 0, 0.35)
+            self._r = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._u, size=self._u)
+
+    def _u(self, *a):
+        self._r.pos, self._r.size = self.pos, self.size
+
+
+class Viewer(FloatLayout):
+    def __init__(self, **kw):
+        super().__init__(**kw)
         self.cap = None
         self.n = 0
         self.fps = 0
@@ -105,67 +135,75 @@ class Viewer(BoxLayout):
         self.meta_rot = 0
         self.man_rot = 0
         self.playing = False
+        self.play_gen = 0
         self.speeds = [1, 2, 4, 8, 16]
         self.si = 0
         self.best = None
+        self.use_jpg = False
+        self.tex = None
+        self._pend = None
+        self._sched = False
 
-        self.img = Image(allow_stretch=True, keep_ratio=True, size_hint_y=0.42)
-        self.info = Label(text="Selecciona un video", size_hint_y=0.07)
-        self.slider = Slider(min=0, max=1, value=0, size_hint_y=0.07)
-        self.slider.bind(value=self.on_slider)
-        self.panel = BoxLayout(orientation="vertical", spacing=4)
+        # --- video a pantalla completa ---
+        self.img = Image(size_hint=(1, 1), allow_stretch=True, keep_ratio=True)
         self.add_widget(self.img)
-        self.add_widget(self.panel)
-        self.info.halign = "center"
-        self.info.valign = "middle"
-        self.info.bind(size=lambda w, s: setattr(w, "text_size", s))
-        self.panel.add_widget(self.info)
+
+        # --- info arriba ---
+        self.info = InfoLabel(text="Toca 'Video' para elegir un video", size_hint=(1, None),
+                              height=dp(28), pos_hint={"x": 0, "top": 0.97}, font_size="12sp")
+        self.add_widget(self.info)
+
+        # --- ocultar/mostrar controles ---
+        self.hide_btn = TButton(text="UI", size_hint=(None, None), size=(dp(46), dp(32)),
+                                pos_hint={"right": 0.99, "top": 0.92})
+        self.hide_btn.bind(on_release=lambda *_: self.toggle_ui())
+        self.add_widget(self.hide_btn)
+
+        # --- panel de controles semitransparente abajo ---
+        self.panel = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(190),
+                               pos_hint={"x": 0, "y": 0}, spacing=dp(3), padding=dp(3))
+        self.slider = Slider(min=0, max=1, value=0, size_hint_y=None, height=dp(36), opacity=0.85)
+        self.slider.bind(value=self.on_slider)
         self.panel.add_widget(self.slider)
 
-        row = BoxLayout(size_hint_y=0.08, spacing=4)
-        row.add_widget(Button(text="Video", on_release=lambda *_: self.pick()))
-        for t, d in (("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)):
-            row.add_widget(Button(text=t, on_release=lambda _, d=d: self.step(d)))
-        self.panel.add_widget(row)
+        def row(items):
+            r = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(3))
+            for t, fn in items:
+                b = TButton(text=t)
+                b.bind(on_release=lambda *_, fn=fn: fn())
+                r.add_widget(b)
+            self.panel.add_widget(r)
+            return r
 
-        row2 = BoxLayout(size_hint_y=0.08, spacing=4)
-        row2.add_widget(Button(text="Inicio", on_release=lambda *_: self.set_start()))
-        row2.add_widget(Button(text="Fin", on_release=lambda *_: self.set_end()))
-        self.fmt = ToggleButton(text="PNG", state="normal")
-        self.fmt.bind(state=lambda w, s: setattr(w, "text", "JPG100" if s == "down" else "PNG"))
-        row2.add_widget(self.fmt)
-        self.panel.add_widget(row2)
+        r1 = row([("Video", self.pick), ("-10", lambda: self.step(-10)), ("-1", lambda: self.step(-1)),
+                  ("Play", self.toggle_play), ("+1", lambda: self.step(1)), ("+10", lambda: self.step(10)),
+                  ("x1", self.cycle_speed)])
+        self.bplay = r1.children[3]
+        self.bspd = r1.children[0]
+        r2 = row([("Inicio", self.set_start), ("Fin", self.set_end), ("Girar", self.rot90),
+                  ("PNG", self.toggle_fmt)])
+        self.bfmt = r2.children[0]
+        row([("Guardar frame", self.save_one), ("Guardar rango", self.save_range),
+             ("Mejor frame", self.find_best), ("Auto nítidos", self.auto_sharp)])
+        self.add_widget(self.panel)
 
-        row4 = BoxLayout(size_hint_y=0.08, spacing=4)
-        self.bplay = Button(text="Play", on_release=lambda *_: self.toggle_play())
-        self.bspd = Button(text="x1", on_release=lambda *_: self.cycle_speed())
-        row4.add_widget(self.bplay)
-        row4.add_widget(self.bspd)
-        row4.add_widget(Button(text="Girar", on_release=lambda *_: self.rot90()))
-        row4.add_widget(Button(text="Mejor frame", on_release=lambda *_: self.find_best()))
-        self.add_widget(row4)
+    # ---------- UI ----------
+    def toggle_ui(self):
+        vis = self.panel.opacity > 0
+        for w in (self.panel, self.info):
+            w.opacity = 0 if vis else 1
+            w.disabled = vis
 
-        row3 = BoxLayout(size_hint_y=0.08, spacing=4)
-        row3.add_widget(Button(text="Guardar frame", on_release=lambda *_: self.save_one()))
-        row3.add_widget(Button(text="Guardar rango", on_release=lambda *_: self.save_range()))
-        row3.add_widget(Button(text="Auto nítidos", on_release=lambda *_: self.auto_sharp()))
-        self.panel.add_widget(row3)
-        self.bind(size=self.relayout)
-        self.relayout()
+    def toggle_fmt(self):
+        self.use_jpg = not self.use_jpg
+        self.bfmt.text = "JPG100" if self.use_jpg else "PNG"
 
-    def relayout(self, *a):
-        land = self.width > self.height
-        self.orientation = "horizontal" if land else "vertical"
-        self.img.size_hint = (0.62, 1) if land else (1, 0.5)
-        self.panel.size_hint = (0.38, 1) if land else (1, 0.5)
-
-    # ---------- util ----------
     @mainthread
     def msg(self, t):
         self.info.text = t
 
     def ext(self):
-        return ("jpg", [cv2.IMWRITE_JPEG_QUALITY, 100]) if self.fmt.state == "down" \
+        return ("jpg", [cv2.IMWRITE_JPEG_QUALITY, 100]) if self.use_jpg \
             else ("png", [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
     def read(self, i):
@@ -179,20 +217,20 @@ class Viewer(BoxLayout):
             request_permissions(PERMS)
         try:
             from plyer import filechooser
-            filechooser.open_file(on_selection=self.on_pick, filters=["*.mp4", "*.mov", "*.mkv", "*.3gp"])
+            filechooser.open_file(on_selection=self.on_pick,
+                                  filters=["*.mp4", "*.mov", "*.mkv", "*.3gp"])
         except Exception as e:
             self.msg("Error selector: %s" % e)
 
     @mainthread
     def on_pick(self, sel):
-        if not sel:
-            return
-        self.load(sel[0])
+        if sel:
+            self.load(sel[0])
 
     def load(self, path):
+        self.stop_play()
         if self.cap:
             self.cap.release()
-        self.stop_play()
         cap = open_cap(path)
         if not cap.isOpened():
             self.msg("No se pudo abrir el video")
@@ -203,10 +241,6 @@ class Viewer(BoxLayout):
         self.best = None
         self.n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 0
-        self.w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if self.meta_rot in (90, 270):
-            self.w, self.h = self.h, self.w
         self.start, self.end = 0, max(self.n - 1, 0)
         self.slider.max = max(self.n - 1, 1)
         self.show(0)
@@ -214,37 +248,48 @@ class Viewer(BoxLayout):
     # ---------- visor ----------
     def on_slider(self, _, v):
         if self.cap and int(v) != self.idx:
+            self.stop_play()
             self.show(int(v))
 
     def step(self, d):
         if self.cap:
+            self.stop_play()
             self.show(min(max(self.idx + d, 0), self.n - 1))
-
-    def show(self, i):
-        f = self.read(i)
-        if f is None:
-            return
-        self.render(f, i)
 
     def orient(self, f):
         return rotate(f, self.meta_rot + self.man_rot)
 
-    def render(self, f, i):
+    def prep(self, f):
+        """Se puede llamar desde cualquier hilo."""
         f = self.orient(f)
+        oh, ow = f.shape[:2]
+        sc = 1280.0 / max(ow, oh)
+        p = cv2.resize(f, (int(ow * sc), int(oh * sc)), interpolation=cv2.INTER_AREA) if sc < 1 else f
+        p = cv2.flip(cv2.cvtColor(p, cv2.COLOR_BGR2RGB), 0)
+        return p.tobytes(), p.shape[1], p.shape[0], ow, oh
+
+    def present(self, pr, i):
+        """Solo hilo principal."""
+        buf, w, h, ow, oh = pr
+        if self.tex is None or tuple(self.tex.size) != (w, h):
+            self.tex = Texture.create(size=(w, h), colorfmt="rgb")
+            self.img.texture = self.tex
+        self.tex.blit_buffer(buf, colorfmt="rgb", bufferfmt="ubyte")
+        self.img.canvas.ask_update()
         self.idx = i
         if int(self.slider.value) != i:
             self.slider.unbind(value=self.on_slider)
             self.slider.value = i
             self.slider.bind(value=self.on_slider)
-        p = cv2.resize(f, (960, int(960 * f.shape[0] / f.shape[1])), interpolation=cv2.INTER_AREA)
-        p = cv2.flip(cv2.cvtColor(p, cv2.COLOR_BGR2RGB), 0)
-        tex = Texture.create(size=(p.shape[1], p.shape[0]), colorfmt="rgb")
-        tex.blit_buffer(p.tobytes(), colorfmt="rgb", bufferfmt="ubyte")
-        self.img.texture = tex
         mark = "  *MEJOR*" if self.best == i else ""
         self.info.text = "%d/%d  %.0ffps  %dx%d  rot%d  [%d-%d]%s" % (
-            i, self.n - 1, self.fps, f.shape[1], f.shape[0],
-            (self.meta_rot + self.man_rot) % 360, self.start, self.end, mark)
+            i, self.n - 1, self.fps, ow, oh, (self.meta_rot + self.man_rot) % 360,
+            self.start, self.end, mark)
+
+    def show(self, i):
+        f = self.read(i)
+        if f is not None:
+            self.present(self.prep(f), i)
 
     def set_start(self):
         self.start = self.idx
@@ -254,44 +299,80 @@ class Viewer(BoxLayout):
         self.end = self.idx
         self.show(self.idx)
 
-    # ---------- reproducción ----------
+    def rot90(self):
+        self.man_rot = (self.man_rot + 90) % 360
+        if self.cap and not self.playing:
+            self.show(self.idx)
+
+    # ---------- reproducción (hilo aparte: no bloquea la pantalla) ----------
     def toggle_play(self):
         if not self.cap:
+            self.msg("Primero elige un video")
             return
         if self.playing:
             self.stop_play()
         else:
             self.playing = True
+            self.play_gen += 1
             self.bplay.text = "Pausa"
-            Clock.schedule_interval(self.tick, 1 / 15.0)
+            threading.Thread(target=self.play_loop, args=(self.play_gen, self.idx), daemon=True).start()
 
     def stop_play(self):
-        if self.playing:
-            Clock.unschedule(self.tick)
         self.playing = False
-        self.bplay.text = "Play"
+        self.play_gen += 1
+        try:
+            self.bplay.text = "Play"
+        except Exception:
+            pass
 
     def cycle_speed(self):
         self.si = (self.si + 1) % len(self.speeds)
         self.bspd.text = "x%d" % self.speeds[self.si]
 
-    def tick(self, dt):
-        sp = self.speeds[self.si]
-        if self.busy or self.idx + sp >= self.n:
-            self.stop_play()
-            return
-        for _ in range(sp - 1):
-            self.cap.grab()
-        ok, f = self.cap.read()
-        if not ok:
-            self.stop_play()
-            return
-        self.render(f, self.idx + sp)
+    def post(self, pr, i):
+        self._pend = (pr, i)
+        if not self._sched:
+            self._sched = True
+            Clock.schedule_once(self._apply)
 
-    def rot90(self):
-        self.man_rot = (self.man_rot + 90) % 360
-        if self.cap:
-            self.show(self.idx)
+    def _apply(self, dt):
+        self._sched = False
+        p, self._pend = self._pend, None
+        if p and self.playing:
+            self.present(*p)
+
+    @mainthread
+    def _ended(self, gen):
+        if gen == self.play_gen:
+            self.stop_play()
+
+    def play_loop(self, gen, start):
+        cap = None
+        try:
+            cap = open_cap(self.path)
+            i = start + 1
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            while self.playing and gen == self.play_gen:
+                t0 = time.time()
+                if self.n and i >= self.n:
+                    break
+                ok, f = cap.read()
+                if not ok:
+                    break
+                self.post(self.prep(f), i)
+                sp = self.speeds[self.si]
+                for _ in range(sp - 1):
+                    cap.grab()
+                i += sp
+                dt = 0.04 - (time.time() - t0)
+                if dt > 0:
+                    time.sleep(dt)
+        except Exception as e:
+            self.msg("Error play: %s" % e)
+        finally:
+            if cap:
+                cap.release()
+        self._ended(gen)
 
     # ---------- mejor frame ----------
     @mainthread
@@ -300,6 +381,8 @@ class Viewer(BoxLayout):
         self.show(i)
 
     def find_best(self):
+        if not self.cap:
+            return
         self.stop_play()
         a, b = sorted((self.start, self.end))
         stride = 1 if (b - a) <= 600 else max(int((b - a) / 600), 2)
@@ -307,8 +390,7 @@ class Viewer(BoxLayout):
         def job():
             cap = open_cap(self.path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, a)
-            best, bi = -1, a
-            i = a
+            best, bi, i = -1, a, a
             while i <= b:
                 ok, f = cap.read()
                 if not ok:
@@ -318,10 +400,10 @@ class Viewer(BoxLayout):
                     best, bi = s_, i
                 for _ in range(stride - 1):
                     cap.grab()
-                if (i - a) % 40 == 0:
+                if ((i - a) // stride) % 20 == 0:
                     self.msg("Buscando mejor frame %d%%" % (100 * (i - a) / max(b - a, 1)))
                 i += stride
-            if stride > 1:  # refinar alrededor del mejor
+            if stride > 1:
                 lo, hi = max(bi - stride, a), min(bi + stride, b)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, lo)
                 for j in range(lo, hi + 1):
@@ -338,13 +420,12 @@ class Viewer(BoxLayout):
     # ---------- guardado ----------
     def name(self, i):
         base = os.path.splitext(os.path.basename(self.path))[0]
-        e, _ = self.ext()
-        return os.path.join(OUT_DIR, "%s_f%06d.%s" % (base, i, e))
+        return os.path.join(OUT_DIR, "%s_f%06d.%s" % (base, i, self.ext()[0]))
 
     def write(self, f, i):
         os.makedirs(OUT_DIR, exist_ok=True)
         p = self.name(i)
-        cv2.imwrite(p, self.orient(f), self.ext()[1])  # resolución original, sin reescalar
+        cv2.imwrite(p, self.orient(f), self.ext()[1])
         scan_media(p)
         return p
 
@@ -369,6 +450,9 @@ class Viewer(BoxLayout):
         threading.Thread(target=w, daemon=True).start()
 
     def save_range(self):
+        if not self.cap:
+            return
+        self.stop_play()
         a, b = sorted((self.start, self.end))
 
         def job():
@@ -384,8 +468,10 @@ class Viewer(BoxLayout):
             self.msg("Rango guardado en DCIM/Frames4K")
         self.run_bg(job)
 
-    # ---------- nitidez ----------
     def auto_sharp(self, top=10):
+        if not self.cap:
+            return
+        self.stop_play()
         a, b = sorted((self.start, self.end))
 
         def job():
@@ -400,10 +486,9 @@ class Viewer(BoxLayout):
                 if i % 20 == 0:
                     self.msg("Analizando %d/%d" % (i - a, b - a))
             cap.release()
-            # mejores N con separación mínima entre frames
             gap = max(int(self.fps / 10), 2)
             sel = []
-            for s, i in sorted(sc, reverse=True):
+            for s_, i in sorted(sc, reverse=True):
                 if all(abs(i - j) >= gap for j in sel):
                     sel.append(i)
                 if len(sel) >= top:
@@ -426,8 +511,13 @@ class FramesApp(App):
             request_permissions(PERMS)
         return Viewer()
 
+    def on_pause(self):
+        self.root.stop_play()
+        return True
+
     def on_stop(self):
         v = self.root
+        v.stop_play()
         if v.cap:
             v.cap.release()
 
