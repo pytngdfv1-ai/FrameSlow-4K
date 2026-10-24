@@ -3,11 +3,21 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    env:
+      KS_B64: ${{ secrets.KEYSTORE_B64 }}
+      KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
     steps:
+      - name: Verificar secrets de firma
+        run: |
+          test -n "$KS_B64" && test -n "$KS_PASS" || { echo "Faltan secrets KEYSTORE_B64 / KEYSTORE_PASSWORD"; exit 1; }
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -36,11 +46,28 @@ jobs:
             ~/.buildozer
           key: buildozer-${{ hashFiles('buildozer.spec') }}
 
+      - name: Versión incremental
+        run: |
+          sed -i "s/^version = .*/version = 1.0.${{ github.run_number }}/" buildozer.spec
+          sed -i "/^version = /a android.numeric_version = ${{ github.run_number }}" buildozer.spec
+
       - name: Compilar APK
         run: buildozer -v android debug
 
-      - name: Subir APK
-        uses: actions/upload-artifact@v4
+      - name: Firmar APK con keystore propio
+        run: |
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks.jks"
+          BT=$(ls -d $HOME/.buildozer/android/platform/android-sdk/build-tools/* | sort -V | tail -1)
+          APK=$(ls bin/*.apk | head -1)
+          $BT/zipalign -p -f 4 "$APK" aligned.apk
+          $BT/apksigner sign --ks "$RUNNER_TEMP/ks.jks" --ks-key-alias frameslow \
+            --ks-pass env:KS_PASS --key-pass env:KS_PASS --out FrameSlow4K.apk aligned.apk
+          $BT/apksigner verify --print-certs FrameSlow4K.apk
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v2
         with:
-          name: Frames4K-apk
-          path: bin/*.apk
+          tag_name: v${{ github.run_number }}
+          name: FrameSlow 4K v${{ github.run_number }}
+          files: FrameSlow4K.apk
+          make_latest: true
