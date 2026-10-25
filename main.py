@@ -1,7 +1,8 @@
-import os, threading, time
+import os, threading, time, traceback, faulthandler
 import cv2
 import numpy as np
 from kivy.app import App
+from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock, mainthread
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle
@@ -28,6 +29,39 @@ if platform == "android":
              Permission.WRITE_EXTERNAL_STORAGE]
 
 Window.clearcolor = (0, 0, 0, 1)
+_FH = None
+
+
+def log(txt):
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        with open(os.path.join(OUT_DIR, "log.txt"), "a") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + txt + "\n")
+    except Exception:
+        pass
+
+
+try:  # registra caídas nativas (segfault/abort) para diagnosticar
+    os.makedirs(OUT_DIR, exist_ok=True)
+    _FH = open(os.path.join(OUT_DIR, "native_crash.log"), "a")
+    faulthandler.enable(file=_FH, all_threads=True)
+except Exception:
+    pass
+
+
+class SafeHandler(ExceptionHandler):
+    """Un error en un botón no cierra la app: se muestra y se registra."""
+    def handle_exception(self, inst):
+        err = "".join(traceback.format_exception(type(inst), inst, inst.__traceback__))
+        log(err)
+        try:
+            App.get_running_app().root.msg("Error: %s" % inst)
+        except Exception:
+            pass
+        return ExceptionManager.PASS
+
+
+ExceptionManager.add_handler(SafeHandler())
 
 
 def scan_media(path):
@@ -146,6 +180,9 @@ class Viewer(FloatLayout):
         self.start = 0
         self.end = 0
         self.busy = False
+        self.lock = threading.RLock()
+        self.play_thread = None
+        self.pending = None
         self.path = None
         self.meta_rot = 0
         self.man_rot = 0
@@ -166,18 +203,18 @@ class Viewer(FloatLayout):
         self.add_widget(self.img)
 
         # --- panel SUPERIOR: reproducción ---
-        self.top = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(94),
+        self.tbar = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(94),
                              pos_hint={"x": 0, "top": 0.97}, spacing=dp(3), padding=dp(3))
         self.slider = Slider(min=0, max=1, value=0, size_hint_y=None, height=dp(36), opacity=0.85)
         self.slider.bind(value=self.on_slider)
-        self.top.add_widget(self.slider)
-        r1 = self._row(self.top, [("Abrir", self.pick), ("-10", lambda: self.step(-10)),
+        self.tbar.add_widget(self.slider)
+        r1 = self._row(self.tbar, [("Abrir", self.pick), ("-10", lambda: self.step(-10)),
                                   ("-1", lambda: self.step(-1)), ("Play", self.toggle_play),
                                   ("+1", lambda: self.step(1)), ("+10", lambda: self.step(10)),
                                   ("x1", self.cycle_speed)])
         self.bplay = r1.children[3]
         self.bspd = r1.children[0]
-        self.add_widget(self.top)
+        self.add_widget(self.tbar)
 
         # --- panel INFERIOR: info + herramientas de exportación ---
         self.panel = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(136),
@@ -212,7 +249,7 @@ class Viewer(FloatLayout):
     # ---------- UI ----------
     def toggle_ui(self):
         vis = self.panel.opacity > 0
-        for w in (self.panel, self.top):
+        for w in (self.panel, self.tbar):
             w.opacity = 0 if vis else 1
             w.disabled = vis
 
@@ -242,8 +279,9 @@ class Viewer(FloatLayout):
         return "png", [cv2.IMWRITE_PNG_COMPRESSION, 3]
 
     def read(self, i):
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
-        ok, f = self.cap.read()
+        with self.lock:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+            ok, f = self.cap.read()
         return f if ok else None
 
     # ---------- carga ----------
@@ -263,14 +301,19 @@ class Viewer(FloatLayout):
             self.load(sel[0])
 
     def load(self, path):
-        self.stop_play()
-        if self.cap:
-            self.cap.release()
-        cap = open_cap(path)
-        if not cap.isOpened():
-            self.msg("No se pudo abrir el video")
+        if self.busy:
+            self.msg("Espera: procesando...")
             return
-        self.cap, self.path = cap, path
+        self.stop_play(wait=True)
+        with self.lock:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            cap = open_cap(path)
+            if not cap.isOpened():
+                self.msg("No se pudo abrir el video")
+                return
+            self.cap, self.path = cap, path
         self.meta_rot = detect_rotation(path, cap)
         self.man_rot = 0
         self.best = None
@@ -282,12 +325,12 @@ class Viewer(FloatLayout):
 
     # ---------- visor ----------
     def on_slider(self, _, v):
-        if self.cap and int(v) != self.idx:
+        if self.cap and not self.busy and int(v) != self.idx:
             self.stop_play()
             self.show(int(v))
 
     def step(self, d):
-        if self.cap:
+        if self.cap and not self.busy:
             self.stop_play()
             self.show(min(max(self.idx + d, 0), self.n - 1))
 
@@ -331,6 +374,8 @@ class Viewer(FloatLayout):
             "B" if self.swap else "A", self.start, self.end, mark)
 
     def show(self, i):
+        if self.busy:
+            return
         f = self.read(i)
         if f is not None:
             self.present(self.prep(f), i)
@@ -353,17 +398,23 @@ class Viewer(FloatLayout):
         if not self.cap:
             self.msg("Primero elige un video")
             return
+        if self.busy:
+            return
         if self.playing:
             self.stop_play()
         else:
             self.playing = True
             self.play_gen += 1
             self.bplay.text = "Pausa"
-            threading.Thread(target=self.play_loop, args=(self.play_gen, self.idx), daemon=True).start()
+            self.play_thread = threading.Thread(target=self.play_loop, args=(self.play_gen, self.idx), daemon=True)
+            self.play_thread.start()
 
-    def stop_play(self):
+    def stop_play(self, wait=False):
         self.playing = False
         self.play_gen += 1
+        t = self.play_thread
+        if wait and t is not None and t is not threading.current_thread():
+            t.join(3)
         try:
             self.bplay.text = "Play"
         except Exception:
@@ -391,38 +442,44 @@ class Viewer(FloatLayout):
             self.stop_play()
 
     def play_loop(self, gen, start):
-        cap = None
         try:
-            cap = open_cap(self.path)
             i = start + 1
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            with self.lock:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             while self.playing and gen == self.play_gen:
                 t0 = time.time()
                 if self.n and i >= self.n:
                     break
-                ok, f = cap.read()
+                sp = self.speeds[self.si]
+                with self.lock:
+                    if gen != self.play_gen:
+                        break
+                    ok, f = self.cap.read()
+                    if ok:
+                        for _ in range(sp - 1):
+                            self.cap.grab()
                 if not ok:
                     break
                 self.post(self.prep(f), i)
-                sp = self.speeds[self.si]
-                for _ in range(sp - 1):
-                    cap.grab()
                 i += sp
                 dt = 0.04 - (time.time() - t0)
                 if dt > 0:
                     time.sleep(dt)
         except Exception as e:
+            log("play: " + traceback.format_exc())
             self.msg("Error play: %s" % e)
-        finally:
-            if cap:
-                cap.release()
         self._ended(gen)
 
     # ---------- mejor frame ----------
-    @mainthread
     def goto(self, i):
         self.best = i
-        self.show(i)
+        self.pending = i  # se muestra al terminar el trabajo
+
+    @mainthread
+    def _finish(self):
+        if self.pending is not None:
+            i, self.pending = self.pending, None
+            self.show(i)
 
     def find_best(self):
         if not self.cap:
@@ -432,7 +489,7 @@ class Viewer(FloatLayout):
         stride = 1 if (b - a) <= 600 else max(int((b - a) / 600), 2)
 
         def job():
-            cap = open_cap(self.path)
+            cap = self.cap
             cap.set(cv2.CAP_PROP_POS_FRAMES, a)
             sc, i = [], a
             while i <= b:
@@ -466,7 +523,6 @@ class Viewer(FloatLayout):
                     if s_ > best:
                         best, bi = s_, j
                 self.msg("Refinando candidato %d/%d" % (cands.index(c) + 1, len(cands)))
-            cap.release()
             self.goto(bi)
         self.run_bg(job)
 
@@ -481,17 +537,17 @@ class Viewer(FloatLayout):
         img = self.bgr(f)
         if self.scale == 2:
             h, w = img.shape[:2]
-            k = min(2.0, 8192.0 / max(w, h))
-            if k > 1:
-                img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_LANCZOS4)
+            if max(w, h) <= 2600:  # 4K ya es máxima resolución: ampliar solo videos HD
+                img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
                 blur = cv2.GaussianBlur(img, (0, 0), 1.2)
-                img = cv2.addWeighted(img, 1.35, blur, -0.35, 0)
+                img = cv2.addWeighted(img, 1.35, blur, -0.35, 0, dst=img)
+                del blur
         cv2.imwrite(p, img, self.ext()[1])
         scan_media(p)
         return p
 
     def save_one(self):
-        if not self.cap:
+        if not self.cap or self.busy:
             return
         f = self.read(self.idx)
         if f is not None:
@@ -500,14 +556,18 @@ class Viewer(FloatLayout):
     def run_bg(self, fn):
         if self.busy or not self.cap:
             return
+        self.stop_play(wait=True)
         self.busy = True
 
         def w():
             try:
-                fn()
+                with self.lock:
+                    fn()
             except Exception as e:
+                log("job: " + traceback.format_exc())
                 self.msg("Error: %s" % e)
             self.busy = False
+            self._finish()
         threading.Thread(target=w, daemon=True).start()
 
     def save_range(self):
@@ -517,7 +577,7 @@ class Viewer(FloatLayout):
         a, b = sorted((self.start, self.end))
 
         def job():
-            cap = open_cap(self.path)
+            cap = self.cap
             cap.set(cv2.CAP_PROP_POS_FRAMES, a)
             for i in range(a, b + 1):
                 ok, f = cap.read()
@@ -525,7 +585,6 @@ class Viewer(FloatLayout):
                     break
                 self.write(f, i)
                 self.msg("Guardando %d/%d" % (i - a + 1, b - a + 1))
-            cap.release()
             self.msg("Rango guardado en DCIM/Frames4K")
         self.run_bg(job)
 
@@ -536,7 +595,7 @@ class Viewer(FloatLayout):
         a, b = sorted((self.start, self.end))
 
         def job():
-            cap = open_cap(self.path)
+            cap = self.cap
             cap.set(cv2.CAP_PROP_POS_FRAMES, a)
             sc = []
             for i in range(a, b + 1):
@@ -546,7 +605,6 @@ class Viewer(FloatLayout):
                 sc.append((frame_score(f), i))
                 if i % 20 == 0:
                     self.msg("Analizando %d/%d" % (i - a, b - a))
-            cap.release()
             gap = max(int(self.fps / 10), 2)
             sel = []
             for s_, i in sorted(sc, reverse=True):
@@ -554,14 +612,13 @@ class Viewer(FloatLayout):
                     sel.append(i)
                 if len(sel) >= top:
                     break
-            cap = open_cap(self.path)
+            cap = self.cap
             for k, i in enumerate(sorted(sel)):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, i)
                 ok, f = cap.read()
                 if ok:
                     self.write(f, i)
                 self.msg("Nítido %d/%d (frame %d)" % (k + 1, len(sel), i))
-            cap.release()
             self.msg("%d frames nítidos guardados" % len(sel))
         self.run_bg(job)
 
@@ -578,9 +635,10 @@ class FramesApp(App):
 
     def on_stop(self):
         v = self.root
-        v.stop_play()
-        if v.cap:
-            v.cap.release()
+        v.stop_play(wait=True)
+        with v.lock:
+            if v.cap:
+                v.cap.release()
 
 
 if __name__ == "__main__":
