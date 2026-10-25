@@ -140,6 +140,7 @@ class Viewer(FloatLayout):
         self.si = 0
         self.best = None
         self.use_jpg = False
+        self.swap = (platform == "android")  # OpenCV en Android entrega R/B invertidos
         self.tex = None
         self._pend = None
         self._sched = False
@@ -181,7 +182,7 @@ class Viewer(FloatLayout):
         self.bplay = r1.children[3]
         self.bspd = r1.children[0]
         r2 = row([("Inicio", self.set_start), ("Fin", self.set_end), ("Girar", self.rot90),
-                  ("PNG", self.toggle_fmt)])
+                  ("Color", self.toggle_color), ("PNG", self.toggle_fmt)])
         self.bfmt = r2.children[0]
         row([("Guardar frame", self.save_one), ("Guardar rango", self.save_range),
              ("Mejor frame", self.find_best), ("Auto nítidos", self.auto_sharp)])
@@ -193,6 +194,11 @@ class Viewer(FloatLayout):
         for w in (self.panel, self.info):
             w.opacity = 0 if vis else 1
             w.disabled = vis
+
+    def toggle_color(self):
+        self.swap = not self.swap
+        if self.cap and not self.playing:
+            self.show(self.idx)
 
     def toggle_fmt(self):
         self.use_jpg = not self.use_jpg
@@ -259,13 +265,22 @@ class Viewer(FloatLayout):
     def orient(self, f):
         return rotate(f, self.meta_rot + self.man_rot)
 
+    def bgr(self, f):
+        """Frame girado y en orden BGR correcto (para guardar)."""
+        f = self.orient(f)
+        if self.swap:
+            f = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+        return f
+
     def prep(self, f):
         """Se puede llamar desde cualquier hilo."""
         f = self.orient(f)
         oh, ow = f.shape[:2]
         sc = 1280.0 / max(ow, oh)
         p = cv2.resize(f, (int(ow * sc), int(oh * sc)), interpolation=cv2.INTER_AREA) if sc < 1 else f
-        p = cv2.flip(cv2.cvtColor(p, cv2.COLOR_BGR2RGB), 0)
+        if not self.swap:
+            p = cv2.cvtColor(p, cv2.COLOR_BGR2RGB)
+        p = cv2.flip(p, 0)
         return p.tobytes(), p.shape[1], p.shape[0], ow, oh
 
     def present(self, pr, i):
@@ -282,9 +297,9 @@ class Viewer(FloatLayout):
             self.slider.value = i
             self.slider.bind(value=self.on_slider)
         mark = "  *MEJOR*" if self.best == i else ""
-        self.info.text = "%d/%d  %.0ffps  %dx%d  rot%d  [%d-%d]%s" % (
+        self.info.text = "%d/%d  %.0ffps  %dx%d  rot%d  col%s  [%d-%d]%s" % (
             i, self.n - 1, self.fps, ow, oh, (self.meta_rot + self.man_rot) % 360,
-            self.start, self.end, mark)
+            "B" if self.swap else "A", self.start, self.end, mark)
 
     def show(self, i):
         f = self.read(i)
@@ -425,7 +440,7 @@ class Viewer(FloatLayout):
     def write(self, f, i):
         os.makedirs(OUT_DIR, exist_ok=True)
         p = self.name(i)
-        cv2.imwrite(p, self.orient(f), self.ext()[1])
+        cv2.imwrite(p, self.bgr(f), self.ext()[1])
         scan_media(p)
         return p
 
