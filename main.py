@@ -98,12 +98,17 @@ class TButton(Button):
     def __init__(self, **kw):
         kw.setdefault("background_normal", "")
         kw.setdefault("background_down", "")
-        kw.setdefault("background_color", (0, 0, 0, 0.38))
+        kw.setdefault("background_color", (0, 0, 0, 0.5))
         kw.setdefault("color", (1, 1, 1, 0.95))
-        kw.setdefault("font_size", "13sp")
+        kw.setdefault("font_size", "12sp")
+        kw.setdefault("bold", True)
         self.base = kw["background_color"]
         super().__init__(**kw)
         self.bind(state=self._st)
+        self.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.halign = "center"
+        self.valign = "middle"
+        self.shorten = True
 
     def _st(self, w, s):
         w.background_color = (1, 1, 1, 0.35) if s == "down" else self.base
@@ -150,7 +155,7 @@ class Viewer(FloatLayout):
         self.add_widget(self.img)
 
         # --- info arriba ---
-        self.info = InfoLabel(text="Toca 'Video' para elegir un video", size_hint=(1, None),
+        self.info = InfoLabel(text="Toca 'Abrir' para elegir un video", size_hint=(1, None),
                               height=dp(28), pos_hint={"x": 0, "top": 0.97}, font_size="12sp")
         self.add_widget(self.info)
 
@@ -176,16 +181,16 @@ class Viewer(FloatLayout):
             self.panel.add_widget(r)
             return r
 
-        r1 = row([("Video", self.pick), ("-10", lambda: self.step(-10)), ("-1", lambda: self.step(-1)),
+        r1 = row([("Abrir", self.pick), ("-10", lambda: self.step(-10)), ("-1", lambda: self.step(-1)),
                   ("Play", self.toggle_play), ("+1", lambda: self.step(1)), ("+10", lambda: self.step(10)),
                   ("x1", self.cycle_speed)])
         self.bplay = r1.children[3]
         self.bspd = r1.children[0]
-        r2 = row([("Inicio", self.set_start), ("Fin", self.set_end), ("Girar", self.rot90),
-                  ("Color", self.toggle_color), ("PNG", self.toggle_fmt)])
+        r2 = row([("Ini", self.set_start), ("Fin", self.set_end), ("Giro", self.rot90),
+                  ("Col", self.toggle_color), ("PNG", self.toggle_fmt)])
         self.bfmt = r2.children[0]
-        row([("Guardar frame", self.save_one), ("Guardar rango", self.save_range),
-             ("Mejor frame", self.find_best), ("Auto nítidos", self.auto_sharp)])
+        row([("Foto", self.save_one), ("Rango", self.save_range),
+             ("Mejor", self.find_best), ("Top10", self.auto_sharp)])
         self.add_widget(self.panel)
 
     # ---------- UI ----------
