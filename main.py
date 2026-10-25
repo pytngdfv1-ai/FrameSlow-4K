@@ -84,13 +84,23 @@ def rotate(f, deg):
     return f
 
 
-def frame_score(f):
+def frame_score(f, size=960):
+    """Definición real: fuerza de los bordes más nítidos (Sobel, percentil alto),
+    sin dejarse engañar por ruido; penaliza sobre/subexposición."""
     h, w = f.shape[:2]
-    g = cv2.cvtColor(cv2.resize(f, (960, max(int(960 * h / w), 1)), interpolation=cv2.INTER_AREA),
-                     cv2.COLOR_BGR2GRAY)
-    lap = cv2.Laplacian(g, cv2.CV_64F).var()
+    k = float(size) / max(w, h)
+    g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+    if k < 1:
+        g = cv2.resize(g, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy).ravel()
+    k90 = int(len(mag) * 0.93)
+    edge = float(np.partition(mag, k90)[k90:].mean())
+    lap = cv2.Laplacian(g, cv2.CV_32F).var()
     clip = (np.count_nonzero(g < 8) + np.count_nonzero(g > 247)) / g.size
-    return lap * (1.0 - min(clip, 0.9))
+    return (edge + 0.05 * lap ** 0.5) * (1.0 - min(clip, 0.9))
 
 
 class TButton(Button):
@@ -145,6 +155,7 @@ class Viewer(FloatLayout):
         self.si = 0
         self.best = None
         self.use_jpg = False
+        self.scale = 1
         self.swap = (platform == "android")  # OpenCV en Android entrega R/B invertidos
         self.tex = None
         self._pend = None
@@ -154,49 +165,54 @@ class Viewer(FloatLayout):
         self.img = Image(size_hint=(1, 1), allow_stretch=True, keep_ratio=True)
         self.add_widget(self.img)
 
-        # --- info arriba ---
-        self.info = InfoLabel(text="Toca 'Abrir' para elegir un video", size_hint=(1, None),
-                              height=dp(28), pos_hint={"x": 0, "top": 0.97}, font_size="12sp")
-        self.add_widget(self.info)
+        # --- panel SUPERIOR: reproducción ---
+        self.top = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(94),
+                             pos_hint={"x": 0, "top": 0.97}, spacing=dp(3), padding=dp(3))
+        self.slider = Slider(min=0, max=1, value=0, size_hint_y=None, height=dp(36), opacity=0.85)
+        self.slider.bind(value=self.on_slider)
+        self.top.add_widget(self.slider)
+        r1 = self._row(self.top, [("Abrir", self.pick), ("-10", lambda: self.step(-10)),
+                                  ("-1", lambda: self.step(-1)), ("Play", self.toggle_play),
+                                  ("+1", lambda: self.step(1)), ("+10", lambda: self.step(10)),
+                                  ("x1", self.cycle_speed)])
+        self.bplay = r1.children[3]
+        self.bspd = r1.children[0]
+        self.add_widget(self.top)
+
+        # --- panel INFERIOR: info + herramientas de exportación ---
+        self.panel = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(136),
+                               pos_hint={"x": 0, "y": 0}, spacing=dp(3), padding=dp(3))
+        self.info = InfoLabel(text="Toca 'Abrir' para elegir un video", size_hint_y=None,
+                              height=dp(30), font_size="12sp")
+        self.panel.add_widget(self.info)
+        r2 = self._row(self.panel, [("Ini", self.set_start), ("Fin", self.set_end), ("Giro", self.rot90),
+                                    ("Col", self.toggle_color), ("Esc x1", self.toggle_scale),
+                                    ("PNG", self.toggle_fmt)])
+        self.bscale = r2.children[1]
+        self.bfmt = r2.children[0]
+        self._row(self.panel, [("Foto", self.save_one), ("Rango", self.save_range),
+                               ("Mejor", self.find_best), ("Top10", self.auto_sharp)])
+        self.add_widget(self.panel)
 
         # --- ocultar/mostrar controles ---
         self.hide_btn = TButton(text="UI", size_hint=(None, None), size=(dp(46), dp(32)),
-                                pos_hint={"right": 0.99, "top": 0.92})
+                                pos_hint={"right": 0.99, "center_y": 0.5})
         self.hide_btn.bind(on_release=lambda *_: self.toggle_ui())
         self.add_widget(self.hide_btn)
 
-        # --- panel de controles semitransparente abajo ---
-        self.panel = BoxLayout(orientation="vertical", size_hint=(1, None), height=dp(190),
-                               pos_hint={"x": 0, "y": 0}, spacing=dp(3), padding=dp(3))
-        self.slider = Slider(min=0, max=1, value=0, size_hint_y=None, height=dp(36), opacity=0.85)
-        self.slider.bind(value=self.on_slider)
-        self.panel.add_widget(self.slider)
-
-        def row(items):
-            r = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(3))
-            for t, fn in items:
-                b = TButton(text=t)
-                b.bind(on_release=lambda *_, fn=fn: fn())
-                r.add_widget(b)
-            self.panel.add_widget(r)
-            return r
-
-        r1 = row([("Abrir", self.pick), ("-10", lambda: self.step(-10)), ("-1", lambda: self.step(-1)),
-                  ("Play", self.toggle_play), ("+1", lambda: self.step(1)), ("+10", lambda: self.step(10)),
-                  ("x1", self.cycle_speed)])
-        self.bplay = r1.children[3]
-        self.bspd = r1.children[0]
-        r2 = row([("Ini", self.set_start), ("Fin", self.set_end), ("Giro", self.rot90),
-                  ("Col", self.toggle_color), ("PNG", self.toggle_fmt)])
-        self.bfmt = r2.children[0]
-        row([("Foto", self.save_one), ("Rango", self.save_range),
-             ("Mejor", self.find_best), ("Top10", self.auto_sharp)])
-        self.add_widget(self.panel)
+    def _row(self, parent, items):
+        r = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(3))
+        for t, fn in items:
+            b = TButton(text=t)
+            b.bind(on_release=lambda *_, fn=fn: fn())
+            r.add_widget(b)
+        parent.add_widget(r)
+        return r
 
     # ---------- UI ----------
     def toggle_ui(self):
         vis = self.panel.opacity > 0
-        for w in (self.panel, self.info):
+        for w in (self.panel, self.top):
             w.opacity = 0 if vis else 1
             w.disabled = vis
 
@@ -204,6 +220,10 @@ class Viewer(FloatLayout):
         self.swap = not self.swap
         if self.cap and not self.playing:
             self.show(self.idx)
+
+    def toggle_scale(self):
+        self.scale = 2 if self.scale == 1 else 1
+        self.bscale.text = "Esc x%d" % self.scale
 
     def toggle_fmt(self):
         self.use_jpg = not self.use_jpg
@@ -214,8 +234,12 @@ class Viewer(FloatLayout):
         self.info.text = t
 
     def ext(self):
-        return ("jpg", [cv2.IMWRITE_JPEG_QUALITY, 100]) if self.use_jpg \
-            else ("png", [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        if self.use_jpg:
+            prm = [cv2.IMWRITE_JPEG_QUALITY, 100]
+            if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
+                prm += [cv2.IMWRITE_JPEG_SAMPLING_FACTOR, 0x111111]  # 4:4:4 sin perder color
+            return "jpg", prm
+        return "png", [cv2.IMWRITE_PNG_COMPRESSION, 3]
 
     def read(self, i):
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
@@ -410,29 +434,38 @@ class Viewer(FloatLayout):
         def job():
             cap = open_cap(self.path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, a)
-            best, bi, i = -1, a, a
+            sc, i = [], a
             while i <= b:
                 ok, f = cap.read()
                 if not ok:
                     break
-                s_ = frame_score(f)
-                if s_ > best:
-                    best, bi = s_, i
+                sc.append((frame_score(f, 960), i))
                 for _ in range(stride - 1):
                     cap.grab()
                 if ((i - a) // stride) % 20 == 0:
                     self.msg("Buscando mejor frame %d%%" % (100 * (i - a) / max(b - a, 1)))
                 i += stride
-            if stride > 1:
-                lo, hi = max(bi - stride, a), min(bi + stride, b)
+            # candidatos: los 5 mejores separados entre sí
+            gap = max(stride, 2)
+            cands = []
+            for s_, i in sorted(sc, reverse=True):
+                if all(abs(i - j) >= gap for j in cands):
+                    cands.append(i)
+                if len(cands) >= 5:
+                    break
+            # refinado fino a resolución alta (hasta 1920 px)
+            best, bi = -1, (cands[0] if cands else a)
+            for c in cands:
+                lo, hi = max(c - stride, a), min(c + stride, b)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, lo)
                 for j in range(lo, hi + 1):
                     ok, f = cap.read()
                     if not ok:
                         break
-                    s_ = frame_score(f)
+                    s_ = frame_score(f, 1920)
                     if s_ > best:
                         best, bi = s_, j
+                self.msg("Refinando candidato %d/%d" % (cands.index(c) + 1, len(cands)))
             cap.release()
             self.goto(bi)
         self.run_bg(job)
@@ -445,7 +478,15 @@ class Viewer(FloatLayout):
     def write(self, f, i):
         os.makedirs(OUT_DIR, exist_ok=True)
         p = self.name(i)
-        cv2.imwrite(p, self.bgr(f), self.ext()[1])
+        img = self.bgr(f)
+        if self.scale == 2:
+            h, w = img.shape[:2]
+            k = min(2.0, 8192.0 / max(w, h))
+            if k > 1:
+                img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_LANCZOS4)
+                blur = cv2.GaussianBlur(img, (0, 0), 1.2)
+                img = cv2.addWeighted(img, 1.35, blur, -0.35, 0)
+        cv2.imwrite(p, img, self.ext()[1])
         scan_media(p)
         return p
 
